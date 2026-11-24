@@ -43,7 +43,7 @@ class Api
     {
         global $DB;
         try {
-            $plugin = self::slug($plugin);
+            $plugin = self::pluginKey(self::cleanSlug($plugin));
             $type = self::slug($type);
             if ($plugin === '' || $type === '') {
                 return;
@@ -82,7 +82,7 @@ class Api
             if (!$n) {
                 return null;
             }
-            self::registerType($n['plugin'], $n['type'], (string) ($a['label'] ?? ''), $n['severity']);
+            self::registerType((string) $a['plugin'], (string) $a['type'], (string) ($a['label'] ?? ''), $n['severity']);
             $rule = Policy::match('plugin', $n['severity'], $n['entities_id'], 0, $n['title'] . ' ' . $n['summary'], $n['plugin'], $n['type']);
             if (!$rule) {
                 self::noRule($n);
@@ -91,8 +91,11 @@ class Api
             [$id, $created] = Escalation::open([
                 'policies_id' => (int) $rule['policies_id'], 'rules_id' => (int) $rule['id'], 'source' => 'plugin', 'source_ref' => mb_substr($n['plugin'] . ':' . $n['type'] . ':' . $n['key'], 0, 100),
                 'dedup_key' => $n['dedup'], 'title' => $n['title'], 'summary' => $n['summary'], 'severity' => $n['severity'], 'entities_id' => $n['entities_id'], 'facts' => $n['facts'], 'actor' => 'plugin',
-            ]);
+            ], self::legacyOccurrence($n));
             $e = Escalation::get($id);
+            if ($created) {
+                Dispatcher::flush($id);
+            }
             return ['id' => $id, 'trace_id' => (string) ($e['trace_id'] ?? ''), 'created' => $created];
         } catch (Throwable $e) {
             Log::file('Api::escalate: ' . $e->getMessage());
@@ -117,12 +120,13 @@ class Api
                 return false;
             }
             $start = self::time($a['start_at'] ?? null) ?: time();
-            self::registerType($n['plugin'], $n['type'], (string) ($a['label'] ?? ''), $n['severity']);
+            self::registerType((string) $a['plugin'], (string) $a['type'], (string) ($a['label'] ?? ''), $n['severity']);
             $now = date('Y-m-d H:i:s');
             $row = ['title' => $n['title'], 'summary' => $n['summary'], 'facts' => json_encode($n['facts'], JSON_UNESCAPED_UNICODE), 'severity' => $n['severity'], 'entities_id' => $n['entities_id'],
                 'url' => (string) ($a['url'] ?? ''), 'start_at' => date('Y-m-d H:i:s', $start), 'due_at' => date('Y-m-d H:i:s', $due), 'date_mod' => $now];
             $cur = null;
-            foreach ($DB->request(['FROM' => self::TRACKED, 'WHERE' => ['plugin_key' => $n['plugin'], 'type_key' => $n['type'], 'ref_key' => $n['key']]]) as $r) {
+            $identity = self::trackedWhere($n);
+            foreach ($DB->request(['FROM' => self::TRACKED, 'WHERE' => $identity]) as $r) {
                 $cur = $r;
             }
             if ($cur) {
@@ -131,7 +135,7 @@ class Api
                 }
                 $DB->update(self::TRACKED, $row, ['id' => $cur['id']]);
             } else {
-                $DB->insert(self::TRACKED, $row + ['plugin_key' => $n['plugin'], 'type_key' => $n['type'], 'ref_key' => $n['key'], 'status' => 'active', 'date_creation' => $now]);
+                $DB->insert(self::TRACKED, $row + $identity + ['status' => 'active', 'date_creation' => $now]);
             }
             return true;
         } catch (Throwable $e) {
@@ -145,16 +149,20 @@ class Api
     {
         global $DB;
         try {
-            $plugin = self::slug($plugin);
-            $type = self::slug($type);
-            $key = trim($key);
-            if ($plugin === '' || $type === '' || $key === '') {
+            $identity = self::identity($plugin, $type, $key);
+            if (!$identity) {
                 return false;
             }
-            $DB->update(self::TRACKED, ['status' => 'done', 'date_mod' => date('Y-m-d H:i:s')], ['plugin_key' => $plugin, 'type_key' => $type, 'ref_key' => $key]);
+            $DB->update(self::TRACKED, ['status' => 'done', 'date_mod' => date('Y-m-d H:i:s')], self::trackedWhere($identity));
+            $active = ['state' => ['open', 'acked']];
+            $matching = $DB->request(['FROM' => Escalation::TABLE, 'WHERE' => $active + ['dedup_key' => $identity['dedup']]]);
+            if ($matching->count() === 0 && ($legacy = self::legacyOccurrence($identity))) {
+                $matching = $DB->request(['FROM' => Escalation::TABLE, 'WHERE' => $active + $legacy]);
+            }
             $hit = false;
-            foreach ($DB->request(['FROM' => Escalation::TABLE, 'WHERE' => ['dedup_key' => self::dedup($plugin, $type, $key), 'state' => ['open', 'acked']]]) as $e) {
-                Escalation::resolve((int) $e['id'], 'plugin ' . $plugin, 0, $note);
+            foreach ($matching as $e) {
+                Escalation::resolve((int) $e['id'], 'plugin ' . $identity['plugin'], 0, $note);
+                Dispatcher::flush((int) $e['id']);
                 $hit = true;
             }
             return $hit;
@@ -168,12 +176,69 @@ class Api
 
     public static function dedup(string $plugin, string $type, string $key): string
     {
-        return mb_substr('plugin:' . $plugin . ':' . $type . ':' . $key, 0, 190);
+        return self::identity($plugin, $type, $key)['dedup'] ?? '';
+    }
+
+    /** Monta a mesma chave a partir dos campos já normalizados da tabela de acompanhamento. */
+    public static function trackedDedup(string $plugin, string $type, string $ref): string
+    {
+        $key = "plugin:$plugin:$type:$ref";
+        return mb_strlen($key) > IntegrationKey::ESCALATION_LIMIT || str_contains($plugin . $type, ':')
+            ? IntegrationKey::digest('plugin', $plugin, $type, $ref) : $key;
     }
 
     public static function slug(string $v): string
     {
-        return mb_substr(preg_replace('/[^a-z0-9_\-:.]/', '', mb_strtolower(trim($v))), 0, 60);
+        return substr(self::cleanSlug($v), 0, 60);
+    }
+
+    private static function cleanSlug(string $v): string
+    {
+        return preg_replace('/[^a-z0-9_\-:.]/', '', mb_strtolower(trim($v)));
+    }
+
+    private static function pluginKey(string $slug): string
+    {
+        return strlen($slug) <= 40 ? $slug : substr(IntegrationKey::digest('p', $slug), 0, 40);
+    }
+
+    private static function identity(string $plugin, string $type, string $key): ?array
+    {
+        $fullPlugin = self::cleanSlug($plugin);
+        $fullType = self::cleanSlug($type);
+        $key = trim($key);
+        if ($fullPlugin === '' || $fullType === '' || $key === '') {
+            return null;
+        }
+        // Os campos da regra continuam usando os slugs compatíveis com as colunas.
+        $plugin = self::pluginKey($fullPlugin);
+        $type = substr($fullType, 0, 60);
+        $ref = $plugin !== $fullPlugin || $type !== $fullType
+            ? IntegrationKey::digest('item', $fullPlugin, $fullType, $key)
+            : IntegrationKey::bounded('ref', $key, IntegrationKey::REFERENCE_LIMIT);
+        return ['plugin' => $plugin, 'type' => $type, 'key' => $ref, 'dedup' => self::trackedDedup($plugin, $type, $ref)];
+    }
+
+    private static function trackedWhere(array $identity): array
+    {
+        return ['plugin_key' => $identity['plugin'], 'type_key' => $identity['type'], 'ref_key' => $identity['key']];
+    }
+
+    /** Usa um vínculo histórico inequívoco, sem procurar apenas pelo prefixo truncado. */
+    private static function legacyOccurrence(array $identity): ?array
+    {
+        global $DB;
+        $legacy = mb_substr('plugin:' . implode(':', self::trackedWhere($identity)), 0, IntegrationKey::ESCALATION_LIMIT);
+        if ($legacy === $identity['dedup']) {
+            return null;
+        }
+        foreach ($DB->request(['SELECT' => 'escalations_id', 'FROM' => self::TRACKED, 'WHERE' => self::trackedWhere($identity)]) as $row) {
+            $id = (int) $row['escalations_id'];
+            if ($id && countElementsInTable(self::TRACKED, ['escalations_id' => $id]) === 1) {
+                return ['id' => $id, 'source' => 'plugin', 'dedup_key' => $legacy];
+            }
+        }
+        return null;
     }
 
     /** @return int|null timestamp */
@@ -188,11 +253,9 @@ class Api
 
     private static function normalize(array $a): ?array
     {
-        $plugin = self::slug((string) ($a['plugin'] ?? ''));
-        $type = self::slug((string) ($a['type'] ?? ''));
-        $key = trim((string) ($a['key'] ?? ''));
+        $identity = self::identity((string) ($a['plugin'] ?? ''), (string) ($a['type'] ?? ''), (string) ($a['key'] ?? ''));
         $title = trim((string) ($a['title'] ?? ''));
-        if ($plugin === '' || $type === '' || $key === '' || $title === '') {
+        if (!$identity || $title === '') {
             Log::file('Api: chamada sem plugin, type, key ou title.');
             return null;
         }
@@ -201,9 +264,9 @@ class Api
         if ($url !== '') {
             $facts['Abrir'] = preg_match('#^https?://#', $url) ? $url : Ui::absUrl($url);
         }
-        return [
-            'plugin' => $plugin, 'type' => $type, 'key' => mb_substr($key, 0, 120), 'title' => mb_substr($title, 0, 255), 'summary' => (string) ($a['summary'] ?? ''),
-            'severity' => max(1, min(5, (int) ($a['severity'] ?? 3))), 'entities_id' => (int) ($a['entities_id'] ?? 0), 'facts' => $facts, 'dedup' => self::dedup($plugin, $type, mb_substr($key, 0, 120)),
+        return $identity + [
+            'title' => mb_substr($title, 0, 255), 'summary' => (string) ($a['summary'] ?? ''),
+            'severity' => max(1, min(5, (int) ($a['severity'] ?? 3))), 'entities_id' => (int) ($a['entities_id'] ?? 0), 'facts' => $facts,
         ];
     }
 

@@ -26,6 +26,24 @@ Chave/pasta: `escalations` · namespace `GlpiPlugin\Escalations` · tabelas `glp
 | SLA | Lê o prazo de solução (SLA) nativo dos chamados: cumprido, estourado, abertos em risco, estouros por entidade. |
 | Saúde do motor | Banner vermelho em todas as telas se o cron não roda há mais de 3 min. |
 
+## Recuperação de entregas
+
+O nível, o marco de SLO e as respectivas entregas são gravados juntos. A ficha, o pop-up de ACK, o webhook, a API e o ACK por WhatsApp tentam processar a fila da ocorrência após a gravação. Se houver uma transação do chamador em andamento, o motor assume o processamento após o commit.
+
+Falhas retornadas pelo canal mantêm as tentativas e o canal reserva configurados. Uma tentativa interrompida durante o envio fica **sem confirmação** na ficha. Como o provedor pode tê-la aceitado, o motor não repete essa tentativa nem aciona o canal reserva automaticamente. O mesmo vale para entradas antigas em fila cujo estado não permite saber se o transporte já foi chamado.
+
+Antes de cada tentativa, o motor confere se o aviso ainda é pertinente. O ACK encerra pedidos de ação pendentes e preserva avisos informativos válidos, como o SLO de resolução. Após o encerramento da ocorrência, os avisos de prazo ainda em curso são dispensados. Estouro de SLO já registrado continua sendo um fato que pode ser comunicado pelos canais externos.
+
+### Modo simulação
+
+A simulação é por canal (Configurações → Caixa de saída e modo simulação). O canal escolhido monta a mensagem e a grava na Caixa de saída com situação **Simulada**, mas não chama SMTP, Teams nem WhatsApp. A Caixa de saída também guarda o conteúdo e o erro quando o envio simulado falha, por exemplo, usuário sem e-mail ou celular.
+
+Uma falha de canal simulado não repete tentativas nem aciona um canal reserva real. O canal reserva só é usado na simulação quando ele também estiver marcado como simulado.
+
+O ACK e a resolução continuam gerando seus avisos no Teams; se o Teams estiver em simulação, eles ficam na Caixa de saída como simulados. No WhatsApp, a resposta automática de confirmação do ACK também é suprimida. Ela não entra na Caixa de saída, que permanece com o propósito original de guardar as mensagens dos níveis e avisos; a supressão fica registrada no log.
+
+Os botões **Testar** em Configurações são envios reais e explícitos, mesmo com a simulação ligada. Use-os apenas para validar o provedor.
+
 ## Para outros plugins (API)
 
 Qualquer plugin, atual ou futuro, escala itens com prazo sem conhecer hierarquias (`src/Api.php`; nunca lança exceção):
@@ -44,6 +62,14 @@ if (class_exists(Api::class) && Api::available()) {
 ```
 
 Os tipos usados aparecem sozinhos em Hierarquias → Regras (origem "Item de plugin"); o administrador liga cada tipo a uma hierarquia e define severidade mínima e % do prazo. Sem regra, nada é escalado (o log registra o aviso uma vez por dia). Quem chama é responsável por `resolve` quando o item deixa de estar crítico.
+
+### Compatibilidade das chaves
+
+Use a mesma referência completa em `track`, `escalate` e `resolve`. No webhook, envie a mesma `dedup_key` na abertura e na recuperação, ou repita `source`, `trigger_id` e `host` quando a chave for gerada. Sem `trigger_id`, o título faz parte da chave gerada. Campos de texto usados como chave continuam aceitando espaços nas pontas conforme a normalização da integração.
+
+Chaves que cabem no formato histórico continuam válidas. Para entradas longas ou composições com delimitadores ambíguos, o plugin usa uma representação com hash e reserva o prefixo `~1:` para uso interno. Essas identidades exigem a mesma grafia da entrada normalizada, incluindo maiúsculas e acentos nas referências. No catálogo de regras, nomes de plugin acima de 40 caracteres ganham uma chave própria. Tipos acima de 60 caracteres continuam roteados pelo prefixo de 60, e a identidade de cada item inclui o tipo completo.
+
+Os identificadores já gravados permanecem intactos. A API pode localizar uma ocorrência histórica por um vínculo único já registrado no acompanhamento. Um prefixo que perdeu caracteres em versões anteriores não prova qual item o originou. Para recuperar um evento legado desse tipo, envie o `dedup_key` histórico exato, se conhecido e fora do prefixo reservado. Se o identificador não puder ser confirmado ou se vários itens já tiverem sido agrupados sob a mesma chave, identifique a ocorrência pelo rastreio e use a ficha para resolvê-la.
 
 ## Instalar
 
@@ -82,7 +108,7 @@ Cria registros `[Teste ESC]`, valida hierarquia, abertura, deduplicação, subid
 - Versão **0.4.0**, testada no **GLPI 12.0** (teste funcional de 40+ verificações, renderização das telas por CLI e chamadas reais ao webhook). **Ainda não testada no GLPI 11** (declara compatibilidade 11.0 a 12.0.x).
 - **Origens ativas por padrão: só o que nasce no GLPI** (chamados, problemas, mudanças, projetos e tarefas de projeto, mais o escalonamento manual). O webhook de eventos e a API para outros plugins vêm **desligados**; ligue em **Configurações → Origens ativas**.
 - `webhook.php` e `inbound.php` ficam fora do login registrando-os no firewall (`Firewall::addPluginStrategyForLegacyScripts` + `SessionManager::registerPluginStatelessPath`, em `setup.php`). No GLPI 12 a variável `$SECURITY_STRATEGY` **não** vale para plugins.
-- Envio real de e-mail, Teams e WhatsApp depende de você configurar cada canal; use o **modo simulação** para testar sem enviar nada.
+- Envio real de e-mail, Teams e WhatsApp depende de você configurar cada canal; use o **modo simulação** para testar sem enviar nada. Os botões de teste são a exceção: eles enviam de verdade para validar o provedor.
 
 ## Pendências e pontos a conferir
 - Resposta do WhatsApp só no provedor Meta; o gateway próprio só envia.

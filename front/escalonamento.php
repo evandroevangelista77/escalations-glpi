@@ -1,6 +1,7 @@
 <?php
 
 use GlpiPlugin\Escalations\Actions;
+use GlpiPlugin\Escalations\Dispatcher;
 use GlpiPlugin\Escalations\Drawer;
 use GlpiPlugin\Escalations\Escalation;
 use GlpiPlugin\Escalations\Log;
@@ -33,7 +34,8 @@ if (!$id && !empty($_GET['novo'])) {
                 'policies_id' => $policy, 'source' => 'manual', 'source_ref' => 'manual', 'title' => (string) $_POST['title'], 'summary' => (string) ($_POST['summary'] ?? ''),
                 'severity' => (int) ($_POST['severity'] ?? 3), 'facts' => ['Aberto por' => Ui::userName((int) Session::getLoginUserID())], 'actor' => 'user',
             ]);
-            Session::addMessageAfterRedirect('Escalonamento aberto. O primeiro nível já foi avisado.', false, INFO);
+            Dispatcher::flush($newId);
+            Session::addMessageAfterRedirect('Escalonamento aberto. Consulte as entregas do primeiro nível na ficha.', false, INFO);
             $go = $self . '?id=' . $newId;
         } catch (Throwable $e) {
             Session::addMessageAfterRedirect($e->getMessage(), false, ERROR);
@@ -73,7 +75,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $err = $msg;
             }
         } else {
-            $msg = Actions::run((string) ($_POST['do'] ?? ''), $id, (int) Session::getLoginUserID(), 'glpi', $_POST);
+            $action = (string) ($_POST['do'] ?? '');
+            $msg = Actions::run($action, $id, (int) Session::getLoginUserID(), 'glpi', $_POST);
+            if ($action !== 'silence') {
+                Dispatcher::flush($id);
+            }
         }
     } catch (Throwable $x) {
         $err = $x->getMessage();
@@ -170,8 +176,9 @@ echo '</div></div></div>';
 
 // entregas por nível
 echo "<div class='col-lg-6'><div class='card h-100'><div class='card-header'><h3 class='card-title'>Entregas</h3></div><div class='table-responsive'><table class='table table-vcenter card-table table-sm'><thead><tr><th>Nível</th><th>Destino</th><th>Canal</th><th>Situação</th><th>Quando</th></tr></thead><tbody>";
-$colors = ['sent' => '#22c55e', 'shown' => '#22c55e', 'acked' => '#3b82f6', 'queued' => '#94a3b8', 'failed' => '#ef4444'];
-$labels = ['sent' => 'enviado', 'shown' => 'exibido', 'acked' => 'encerrado', 'queued' => 'na fila', 'failed' => 'falhou'];
+$colors = ['sent' => '#22c55e', 'shown' => '#22c55e', 'acked' => '#3b82f6', 'queued' => '#94a3b8', 'failed' => '#ef4444', 'uncertain' => '#f59e0b'];
+$labels = ['sent' => 'enviado', 'shown' => 'exibido', 'acked' => 'encerrado', 'queued' => 'na fila', 'failed' => 'falhou',
+    'sending' => 'em envio', 'uncertain' => 'sem confirmação', 'obsolete' => 'dispensado'];
 $any = false;
 foreach ($DB->request(['FROM' => Escalation::DELIVERIES, 'WHERE' => ['escalations_id' => $id], 'ORDER' => ['id'], 'LIMIT' => 200]) as $d) {
     $any = true;

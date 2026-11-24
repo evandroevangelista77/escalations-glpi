@@ -9,18 +9,12 @@ use GlpiPlugin\Escalations\Policy;
 use GlpiPlugin\Escalations\Settings;
 use GlpiPlugin\Escalations\Slo;
 
-/** Tabelas, configuração padrão, direitos (com aba em Perfis) e as ações automáticas. */
-function plugin_escalations_install(): bool
+/** Definições das tabelas usadas na instalação e nos testes isolados. */
+function plugin_escalations_table_definitions(string $sign): array
 {
-    global $DB;
-
-    $charset   = DBConnection::getDefaultCharset();
-    $collation = DBConnection::getDefaultCollation();
-    $sign      = DBConnection::getDefaultPrimaryKeySignOption();
-    $opts      = "ENGINE=InnoDB DEFAULT CHARSET=$charset COLLATE=$collation ROW_FORMAT=DYNAMIC";
     $int       = "int $sign NOT NULL DEFAULT 0";
 
-    $tables = [
+    return [
         // hierarquia: SLO de ACK e de resolução, meta, janela, repetição do último nível e dono (recebe avisos de SLO)
         Policy::TABLE => "`id` int $sign NOT NULL AUTO_INCREMENT, `name` varchar(255) NOT NULL, `area` varchar(100) NOT NULL DEFAULT '', `description` text,
             `is_active` tinyint NOT NULL DEFAULT 1, `users_id_owner` $int, `ack_slo_min` int NOT NULL DEFAULT 15, `resolve_slo_min` int NOT NULL DEFAULT 240,
@@ -88,7 +82,18 @@ function plugin_escalations_install(): bool
             `mtta_s` int NOT NULL DEFAULT 0, `mttr_s` int NOT NULL DEFAULT 0, `ack_pct` decimal(6,2) NOT NULL DEFAULT 100, `res_pct` decimal(6,2) NOT NULL DEFAULT 100, `budget_pct` decimal(7,1) NOT NULL DEFAULT 100,
             PRIMARY KEY (`id`), UNIQUE KEY `day` (`snap_date`, `policies_id`)",
     ];
-    foreach ($tables as $table => $def) {
+}
+
+/** Tabelas, configuração padrão, direitos (com aba em Perfis) e as ações automáticas. */
+function plugin_escalations_install(): bool
+{
+    global $DB;
+
+    $charset   = DBConnection::getDefaultCharset();
+    $collation = DBConnection::getDefaultCollation();
+    $sign      = DBConnection::getDefaultPrimaryKeySignOption();
+    $opts      = "ENGINE=InnoDB DEFAULT CHARSET=$charset COLLATE=$collation ROW_FORMAT=DYNAMIC";
+    foreach (plugin_escalations_table_definitions($sign) as $table => $def) {
         if (!$DB->tableExists($table)) {
             $DB->doQuery("CREATE TABLE `$table` ($def) $opts");
         }

@@ -13,13 +13,14 @@ class Dispatcher
     /** Espera (minutos) antes da 2ª, 3ª... tentativa. */
     private const BACKOFF = [1, 5, 15, 30];
 
-    /**
-     * Registra e tenta enviar. $uid = 0 para o canal da equipe (Teams).
-     * $kind: level | slo_warn:ack | slo_breach:ack | slo_warn:resolve | slo_breach:resolve | exhausted.
-     */
-    public static function deliver(array $e, ?array $level, string $channel, int $uid, int $round = 0, string $kind = 'level', string $role = 'act'): int
+    /** Grava a intenção na transação que iniciou o nível ou aviso, sem chamar o transporte. */
+    public static function enqueue(array $e, int $level, string $channel, int $uid, int $round = 0, string $kind = 'level', string $role = 'act'): ?int
     {
         global $DB;
+        $key = ['escalations_id' => (int) $e['id'], 'level' => $level, 'round' => $round, 'kind' => $kind, 'channel' => $channel, 'users_id' => $uid];
+        if (countElementsInTable(Escalation::DELIVERIES, $key)) {
+            return null;
+        }
         $now = date('Y-m-d H:i:s');
         $recipient = match ($channel) {
             'email'    => $uid ? Channels::userEmail($uid) : '',
@@ -27,118 +28,236 @@ class Dispatcher
             'teams'    => 'Canal do Teams',
             default    => Ui::userName($uid),
         };
-        $DB->insert(Escalation::DELIVERIES, [
-            'escalations_id' => (int) $e['id'], 'trace_id' => $e['trace_id'], 'level' => (int) ($level['position'] ?? 0), 'round' => $round, 'kind' => $kind, 'role' => $role === 'notify' ? 'notify' : 'act',
-            'channel' => $channel, 'users_id' => $uid, 'recipient' => mb_substr($recipient, 0, 255), 'status' => 'queued', 'attempts' => 0,
+        $DB->insert(Escalation::DELIVERIES, $key + [
+            'trace_id' => $e['trace_id'], 'role' => $role === 'notify' ? 'notify' : 'act',
+            'recipient' => mb_substr($recipient, 0, 255), 'status' => 'queued', 'attempts' => 0,
+            // O legado gravava queued sem distinguir se o transporte já havia sido chamado.
+            'next_try' => $channel === 'popup' ? null : $now,
             'date_creation' => $now, 'date_mod' => $now,
         ]);
         $id = (int) $DB->insertId();
         if ($channel === 'popup') {
-            Log::write($e, 'delivery', ['channel' => 'popup', 'status' => 'ok', 'level' => (int) ($level['position'] ?? 0), 'target_type' => 'user', 'target_id' => $uid,
+            Log::write($e, 'delivery', ['channel' => 'popup', 'status' => 'ok', 'level' => $level, 'target_type' => 'user', 'target_id' => $uid,
                 'actor' => 'system', 'message' => 'Pop-up registrado para ' . Ui::userName($uid) . ' (aparece quando o GLPI estiver aberto no navegador dele).',
                 'detail' => ['delivery' => $id, 'kind' => $kind, 'round' => $round]]);
-            return $id;
         }
-        self::attempt($id);
         return $id;
     }
 
-    /** Uma tentativa de envio de um registro. Atualiza o registro e grava o log. */
-    public static function attempt(int $id): void
+    /** Processa os registros já confirmados no banco. Executar fora da transação de origem. */
+    public static function retries(?int $escalationId = null): int
     {
         global $DB;
-        $d = null;
-        foreach ($DB->request(['FROM' => Escalation::DELIVERIES, 'WHERE' => ['id' => $id]]) as $r) {
-            $d = $r;
+        if (Transaction::isActive()) {
+            return 0;
         }
-        $e = $d ? Escalation::get((int) $d['escalations_id']) : null;
-        if (!$d || !$e) {
-            return;
+        $where = ['channel' => ['<>', 'popup'], ['OR' => [
+            ['status' => ['queued', 'sending']],
+            ['status' => 'failed', 'next_try' => ['<=', date('Y-m-d H:i:s')]],
+        ]]];
+        if ($escalationId !== null) {
+            $where['escalations_id'] = $escalationId;
         }
-        $level = (int) $d['level'] ? Policy::level((int) $e['policies_id'], (int) $d['level']) : null;
-        $attempt = (int) $d['attempts'] + 1;
-        $max = max(1, Settings::int('max_attempts') ?: 3);
-
-        $noRetry = false;
-        $copy = [];
-        if (!Channels::enabled($d['channel'])) {
-            $res = ['ok' => false, 'provider_id' => '', 'error' => 'Canal desligado ou não configurado.', 'ms' => 0, 'detail' => []];
-            $noRetry = true; // não adianta tentar de novo
-        } else {
-            try {
-                $c = Message::context($e, $level, (string) $d['kind']);
-                $c['role'] = (string) ($d['role'] ?? 'act');
-                $copy = Outbox::copyOf((string) $d['channel'], $c);
-                if (Channels::sinked((string) $d['channel']) && ($d['channel'] === 'teams' || (string) $d['recipient'] !== '')) {
-                    // simulação: não envia; a cópia fica na Caixa de saída
-                    $res = ['ok' => true, 'provider_id' => 'simulado', 'error' => '', 'ms' => 0, 'detail' => ['simulado' => true]];
-                } else {
-                    $res = match ($d['channel']) {
-                        'email'    => Channels::mail($c, ['id' => (int) $d['users_id'], 'email' => (string) $d['recipient'], 'name' => Ui::userName((int) $d['users_id'])]),
-                        'teams'    => Channels::teams($c),
-                        'whatsapp' => Channels::whatsapp($c, (string) $d['recipient']),
-                        default    => ['ok' => false, 'provider_id' => '', 'error' => 'Canal desconhecido.', 'ms' => 0, 'detail' => []],
-                    };
-                }
-            } catch (Throwable $t) {
-                $res = ['ok' => false, 'provider_id' => '', 'error' => $t->getMessage(), 'ms' => 0, 'detail' => []];
-            }
-        }
-
-        $now = date('Y-m-d H:i:s');
-        $upd = ['attempts' => $attempt, 'date_mod' => $now, 'provider_id' => mb_substr((string) $res['provider_id'], 0, 190)];
-        if ($res['ok']) {
-            $upd += ['status' => 'sent', 'sent_at' => $now, 'error' => null, 'next_try' => null];
-        } else {
-            $retry = !$noRetry && $attempt < $max;
-            $upd += ['status' => 'failed', 'error' => mb_substr((string) $res['error'], 0, 500),
-                'next_try' => $retry ? date('Y-m-d H:i:s', time() + self::BACKOFF[min($attempt - 1, count(self::BACKOFF) - 1)] * 60) : null];
-        }
-        $DB->update(Escalation::DELIVERIES, $upd, ['id' => $id]);
-        Outbox::record($e, $d, $copy, $res['ok'] ? (Channels::sinked((string) $d['channel']) ? 'sim' : 'sent') : 'failed', $res['ok'] ? '' : (string) $res['error']);
-
-        $label = Policy::CHANNELS[$d['channel']][0] ?? $d['channel'];
-        $who = (int) $d['users_id'] ? Ui::userName((int) $d['users_id']) : 'canal da equipe';
-        Log::write($e, $attempt > 1 ? 'retry' : 'delivery', [
-            'channel' => $d['channel'], 'level' => (int) $d['level'], 'target_type' => (int) $d['users_id'] ? 'user' : 'channel', 'target_id' => (int) $d['users_id'],
-            'status' => $res['ok'] ? 'ok' : 'fail', 'actor' => 'system', 'duration_ms' => (int) $res['ms'],
-            'message' => $res['ok'] ? $label . ' enviado para ' . $who . ' (tentativa ' . $attempt . ').' : $label . ' falhou para ' . $who . ' (tentativa ' . $attempt . '): ' . $res['error'],
-            'detail' => ['delivery' => $id, 'kind' => $d['kind'], 'round' => (int) $d['round'], 'attempt' => $attempt, 'provider_id' => $res['provider_id']] + (array) $res['detail'],
-        ]);
-        if (!$res['ok'] && $upd['next_try'] === null) {
-            self::fallback($e, $d, $level);
-        }
-    }
-
-    /** Falha definitiva: aciona o canal reserva (uma vez por destinatário e nível). */
-    private static function fallback(array $e, array $d, ?array $level): void
-    {
-        $fb = Settings::get('fallback_channel');
-        if ($fb === '' || $fb === 'none' || $fb === $d['channel'] || !(int) $d['users_id'] || !Channels::enabled($fb)) {
-            return;
-        }
-        if (countElementsInTable(Escalation::DELIVERIES, ['escalations_id' => $d['escalations_id'], 'users_id' => $d['users_id'], 'level' => $d['level'], 'round' => $d['round'], 'kind' => $d['kind'], 'channel' => $fb])) {
-            return;
-        }
-        Log::write($e, 'fallback', ['channel' => $fb, 'level' => (int) $d['level'], 'status' => 'warn', 'target_type' => 'user', 'target_id' => (int) $d['users_id'], 'actor' => 'system',
-            'message' => (Policy::CHANNELS[$d['channel']][0] ?? $d['channel']) . ' falhou em definitivo para ' . Ui::userName((int) $d['users_id']) . '; acionando o canal reserva (' . (Policy::CHANNELS[$fb][0] ?? $fb) . ').']);
-        self::deliver($e, $level, $fb, (int) $d['users_id'], (int) $d['round'], (string) $d['kind'], (string) ($d['role'] ?? 'act'));
-    }
-
-    /** Reenvia o que falhou e ainda tem tentativas. */
-    public static function retries(): int
-    {
-        global $DB;
         $n = 0;
-        foreach ($DB->request(['SELECT' => 'id', 'FROM' => Escalation::DELIVERIES, 'WHERE' => ['status' => 'failed', ['NOT' => ['next_try' => null]], 'next_try' => ['<=', date('Y-m-d H:i:s')]], 'LIMIT' => 50]) as $r) {
-            self::attempt((int) $r['id']);
-            $n++;
-        }
+        $last = 0;
+        // Uma ocorrência ocupada ou uma linha com erro não pode bloquear o restante da fila.
+        do {
+            $cursor = $last;
+            foreach ($DB->request(['SELECT' => ['id', 'escalations_id'], 'FROM' => Escalation::DELIVERIES,
+                'WHERE' => $where + ['id' => ['>', $cursor]], 'ORDER' => 'id', 'LIMIT' => 50]) as $r) {
+                $last = (int) $r['id'];
+                try {
+                    $n += Escalation::withLock((int) $r['escalations_id'], static fn (?array $e): bool =>
+                        $e && self::attempt($e, (int) $r['id']), 0) ? 1 : 0;
+                } catch (Throwable $t) {
+                    Log::file('delivery ' . $last . ': ' . $t->getMessage());
+                }
+                if ($n === 50) {
+                    return $n;
+                }
+            }
+        } while ($last !== $cursor);
         return $n;
     }
 
-    /** Avisa a quem cuida da hierarquia (dono): SLO em risco/estourado, cadeia esgotada. */
-    public static function notifyOwner(array $e, string $kind): void
+    /** O processamento imediato é opcional após a gravação. O cron recupera a fila restante. */
+    public static function flush(int $escalationId): void
+    {
+        try {
+            self::retries($escalationId);
+        } catch (Throwable $t) {
+            Log::file('dispatch ' . $escalationId . ': ' . $t->getMessage());
+        }
+    }
+
+    /** Uma tentativa sob a trava da ocorrência. O estado sending é persistido antes do transporte. */
+    private static function attempt(array $e, int $id): bool
+    {
+        global $DB;
+        $d = null;
+        foreach ($DB->request(['FROM' => Escalation::DELIVERIES, 'WHERE' => ['id' => $id]]) as $row) {
+            $d = $row;
+        }
+        $now = date('Y-m-d H:i:s');
+        if (!$d || $d['channel'] === 'popup' || !in_array($d['status'], ['queued', 'sending', 'failed'], true)
+            || ($d['status'] === 'failed' && (!$d['next_try'] || $d['next_try'] > $now))) {
+            return false;
+        }
+        if ($d['status'] === 'sending' || ($d['status'] === 'queued' && !$d['next_try'])) {
+            // Se a trava foi adquirida, nenhum outro executor do plugin está enviando esta linha.
+            // O provedor pode ter aceitado a tentativa anterior. Evita reenvio e reserva automáticos.
+            self::discard($e, $d, 'uncertain', 'Envio sem confirmação local. O provedor pode ter recebido a mensagem.');
+            return true;
+        }
+        if (NativeItem::close($e)) {
+            $e = Escalation::get((int) $e['id']);
+        }
+        if (!self::isRelevant($e, $d)) {
+            self::discard($e, $d, 'obsolete', 'Envio dispensado após mudança no estado do escalonamento.');
+            return true;
+        }
+
+        $channel = (string) $d['channel'];
+        $announcement = str_starts_with($d['kind'], 'announce:');
+        $level = (int) $d['level'] ? Policy::level((int) $e['policies_id'], (int) $d['level']) : null;
+        $number = (int) $d['attempts'] + 1;
+        $sinked = Channels::sinked($channel);
+        $simulated = false;
+        // A simulação também vale quando o canal real está desligado: ela não depende do provedor.
+        $enabled = $sinked || Channels::enabled($channel);
+        // Um canal simulado nunca repete a tentativa nem aciona um canal reserva real.
+        $terminal = $announcement || !$enabled || $sinked;
+        $copy = [];
+        $result = self::failure('Canal desligado ou não configurado.');
+        if ($enabled) {
+            try {
+                if ($announcement) {
+                    $text = self::announcementText($e, $d['kind']);
+                    $copy = ['Aviso no canal do Teams', '', $text];
+                } else {
+                    $context = Message::context($e, $level, $d['kind']);
+                    $context['role'] = (string) $d['role'];
+                    $copy = Outbox::copyOf($channel, $context);
+                }
+            } catch (Throwable $t) {
+                self::finish($e, $d, $number, self::failure($t->getMessage()), [], false, $terminal);
+                return true;
+            }
+
+            if ($sinked) {
+                if ($channel === 'email' && (string) $d['recipient'] === '') {
+                    $result = self::failure('Usuário sem e-mail cadastrado.');
+                } elseif ($channel === 'whatsapp' && (string) $d['recipient'] === '') {
+                    $result = self::failure('Usuário sem celular cadastrado (campo "Celular" do usuário no GLPI).');
+                } else {
+                    $simulated = true;
+                    $result = Channels::simulationResult();
+                }
+            } else {
+                $DB->update(Escalation::DELIVERIES, ['status' => 'sending', 'attempts' => $number, 'next_try' => null, 'date_mod' => $now], [
+                    'id' => $id, 'status' => $d['status'], 'attempts' => $d['attempts'],
+                ]);
+                if ($DB->affectedRows() !== 1) {
+                    return false;
+                }
+                $result = $announcement ? Channels::teamsText($text) + ['provider_id' => ''] : match ($channel) {
+                    'email'    => Channels::mail($context, ['id' => (int) $d['users_id'], 'email' => (string) $d['recipient'], 'name' => Ui::userName((int) $d['users_id'])]),
+                    'teams'    => Channels::teams($context),
+                    'whatsapp' => Channels::whatsapp($context, (string) $d['recipient']),
+                    default   => self::failure('Canal desconhecido.'),
+                };
+            }
+        }
+        self::finish($e, $d, $number, $result, $copy, $simulated, $terminal);
+        return true;
+    }
+
+    private static function failure(string $error): array
+    {
+        return ['ok' => false, 'provider_id' => '', 'error' => $error, 'ms' => 0, 'detail' => []];
+    }
+
+    private static function isRelevant(array $e, array $d): bool
+    {
+        $active = in_array($e['state'], ['open', 'acked'], true);
+        return match ($d['kind']) {
+            'level' => $e['state'] === 'open' || ($e['state'] === 'acked' && $d['role'] === 'notify'),
+            'slo_warn:ack' => $e['state'] === 'open',
+            'slo_breach:ack', 'slo_breach:resolve' => $active || $d['channel'] !== 'popup',
+            'announce:ack', 'announce:resolve' => true,
+            default => $active,
+        };
+    }
+
+    private static function discard(array $e, array $d, string $status, string $reason): void
+    {
+        Transaction::run(static function () use ($e, $d, $status, $reason): void {
+            global $DB;
+            $DB->update(Escalation::DELIVERIES, ['status' => $status, 'next_try' => null, 'error' => $reason,
+                'date_mod' => date('Y-m-d H:i:s')], ['id' => $d['id']]);
+            Log::write($e, 'delivery', ['channel' => $d['channel'], 'level' => (int) $d['level'],
+                'status' => $status === 'uncertain' ? 'warn' : 'info', 'message' => $reason,
+                'detail' => ['delivery' => (int) $d['id'], 'kind' => $d['kind'], 'outcome' => $status]]);
+        });
+    }
+
+    private static function finish(array $e, array $d, int $number, array $result, array $copy, bool $simulated, bool $terminal): void
+    {
+        $fallback = Transaction::run(static function () use ($e, $d, $number, $result, $copy, $simulated, $terminal): ?int {
+            global $DB;
+            $now = date('Y-m-d H:i:s');
+            $max = max(1, Settings::int('max_attempts') ?: 3);
+            $retry = !$result['ok'] && !$terminal && $number < $max;
+            $next = $retry ? date('Y-m-d H:i:s', time() + self::BACKOFF[min($number - 1, count(self::BACKOFF) - 1)] * 60) : null;
+            $DB->update(Escalation::DELIVERIES, [
+                'status' => $result['ok'] ? 'sent' : 'failed', 'attempts' => $number, 'date_mod' => $now,
+                'sent_at' => $result['ok'] ? $now : null, 'next_try' => $next,
+                'provider_id' => mb_substr((string) $result['provider_id'], 0, 190),
+                'error' => $result['ok'] ? null : mb_substr((string) $result['error'], 0, 500),
+            ], ['id' => $d['id']]);
+            Outbox::record($e, $d, $copy, $result['ok'] ? ($simulated ? 'sim' : 'sent') : 'failed', $result['error']);
+
+            $label = Policy::CHANNELS[$d['channel']][0] ?? $d['channel'];
+            $who = (int) $d['users_id'] ? Ui::userName((int) $d['users_id']) : 'canal da equipe';
+            Log::write($e, $number > 1 ? 'retry' : 'delivery', [
+                'channel' => $d['channel'], 'level' => (int) $d['level'], 'target_type' => (int) $d['users_id'] ? 'user' : 'channel', 'target_id' => (int) $d['users_id'],
+                'status' => $result['ok'] ? 'ok' : 'fail', 'actor' => 'system', 'duration_ms' => (int) $result['ms'],
+                'message' => $result['ok']
+                    ? $label . ($simulated ? ' simulado para ' : ' enviado para ') . $who . ' (tentativa ' . $number . ').'
+                    : $label . ' falhou para ' . $who . ' (tentativa ' . $number . '): ' . $result['error'],
+                'detail' => ['delivery' => (int) $d['id'], 'kind' => $d['kind'], 'round' => (int) $d['round'], 'attempt' => $number, 'provider_id' => $result['provider_id']] + $result['detail'],
+            ]);
+            return !$result['ok'] && !$retry ? self::stageFallback($e, $d) : null;
+        });
+        if ($fallback !== null) {
+            self::attempt($e, $fallback);
+        }
+    }
+
+    /** A falha definitiva e a intenção do canal reserva são confirmadas juntas. */
+    private static function stageFallback(array $e, array $d): ?int
+    {
+        $fb = Settings::get('fallback_channel');
+        if ($fb === '' || $fb === 'none' || $fb === $d['channel'] || !(int) $d['users_id']
+            || (!Channels::enabled($fb) && !Channels::sinked($fb))) {
+            return null;
+        }
+        if (Channels::sinked((string) $d['channel']) && !Channels::sinked($fb)) {
+            Log::write($e, 'delivery', ['channel' => (string) $d['channel'], 'level' => (int) $d['level'], 'status' => 'warn', 'target_type' => 'user', 'target_id' => (int) $d['users_id'], 'actor' => 'system',
+                'message' => (Policy::CHANNELS[$d['channel']][0] ?? $d['channel']) . ' simulado falhou para ' . Ui::userName((int) $d['users_id'])
+                    . '; o canal reserva (' . (Policy::CHANNELS[$fb][0] ?? $fb) . ') não foi acionado para não enviar de verdade durante a simulação.']);
+            return null;
+        }
+        $id = self::enqueue($e, (int) $d['level'], $fb, (int) $d['users_id'], (int) $d['round'], $d['kind'], $d['role']);
+        if ($id !== null) {
+            Log::write($e, 'fallback', ['channel' => $fb, 'level' => (int) $d['level'], 'status' => 'warn', 'target_type' => 'user', 'target_id' => (int) $d['users_id'], 'actor' => 'system',
+                'message' => (Policy::CHANNELS[$d['channel']][0] ?? $d['channel']) . ' falhou em definitivo para ' . Ui::userName((int) $d['users_id']) . '; acionando o canal reserva (' . (Policy::CHANNELS[$fb][0] ?? $fb) . ').']);
+        }
+        return $id;
+    }
+
+    /** Registra aviso de SLO ou esgotamento ao dono junto com o marco correspondente. */
+    public static function stageOwnerNotice(array $e, string $kind): void
     {
         $policy = Policy::get((int) $e['policies_id']);
         $owner = (int) ($policy['users_id_owner'] ?? 0);
@@ -148,24 +267,25 @@ class Dispatcher
         }
         Bridge::notify($e, [$owner], ($kind === 'exhausted' ? 'Cadeia esgotada: ' : 'SLO: ') . $e['title'], 'Aviso ao responsável pela hierarquia (' . $kind . ').', 'danger');
         foreach (Settings::channels(Settings::get('owner_channels')) as $ch) {
-            self::deliver($e, null, $ch, $ch === 'teams' ? 0 : $owner, 0, $kind);
+            self::enqueue($e, 0, $ch, $ch === 'teams' ? 0 : $owner, 0, $kind);
         }
     }
 
-    /** Aviso solto no Teams (ACK, resolvido). Não gera pendência. */
-    public static function announce(?array $e, string $text): void
+    /** Aviso informativo de transição já confirmada, no Teams. */
+    public static function stageAnnouncement(array $e, string $kind): void
     {
-        if (!$e || !Channels::enabled('teams')) {
-            return;
+        if (Channels::enabled('teams')) {
+            self::enqueue($e, 0, 'teams', 0, 0, $kind, 'notify');
         }
-        if (Channels::sinked('teams')) { // simulação: guarda o aviso na Caixa de saída
-            Outbox::record($e, ['id' => 0, 'level' => 0, 'channel' => 'teams', 'users_id' => 0, 'recipient' => 'Canal do Teams'], ['Aviso no canal do Teams', '', '[' . $e['trace_id'] . '] ' . $e['title'] . ' — ' . $text], 'sim');
-            Log::write($e, 'delivery', ['channel' => 'teams', 'status' => 'ok', 'actor' => 'system', 'message' => 'Aviso no Teams (simulado): ' . $text]);
-            return;
-        }
-        $r = Channels::teamsText('[' . $e['trace_id'] . '] ' . $e['title'] . ' — ' . $text);
-        Log::write($e, 'delivery', ['channel' => 'teams', 'status' => $r['ok'] ? 'ok' : 'fail', 'duration_ms' => (int) $r['ms'], 'actor' => 'system',
-            'message' => $r['ok'] ? 'Aviso no Teams: ' . $text : 'Aviso no Teams falhou: ' . $r['error'], 'detail' => $r['detail']]);
+    }
+
+    private static function announcementText(array $e, string $kind): string
+    {
+        $opened = strtotime((string) $e['opened_at']);
+        $text = $kind === 'announce:ack'
+            ? 'Reconhecido por ' . Ui::userName((int) $e['users_id_ack']) . ' em ' . Ui::dur(strtotime((string) $e['acked_at']) - $opened) . '. A escalada foi interrompida.'
+            : 'Resolvido após ' . Ui::dur(strtotime((string) $e['resolved_at']) - $opened) . '.';
+        return '[' . $e['trace_id'] . '] ' . $e['title'] . ' — ' . $text;
     }
 
     // ------------------------------------------------------------------ pop-up
@@ -187,13 +307,15 @@ class Dispatcher
             if (!$e) {
                 continue;
             }
-            $alive = $d['kind'] === 'level' ? $e['state'] === 'open' : in_array($e['state'], ['open', 'acked'], true);
-            if (!$alive) {
-                $DB->update(Escalation::DELIVERIES, ['status' => 'acked', 'date_mod' => $now], ['id' => $d['id']]);
+            if (!self::isRelevant($e, $d) || NativeItem::isClosed($e)) {
+                $DB->update(Escalation::DELIVERIES, ['status' => 'acked', 'date_mod' => $now], ['id' => $d['id'], 'status' => ['queued', 'shown']]);
                 continue;
             }
             if ($d['status'] === 'queued') {
-                $DB->update(Escalation::DELIVERIES, ['status' => 'shown', 'shown_at' => $now, 'date_mod' => $now], ['id' => $d['id']]);
+                $DB->update(Escalation::DELIVERIES, ['status' => 'shown', 'shown_at' => $now, 'date_mod' => $now], ['id' => $d['id'], 'status' => 'queued']);
+                if ($DB->affectedRows() !== 1) {
+                    continue;
+                }
                 $lag = time() - strtotime((string) $d['date_creation']);
                 Log::write($e, 'popup_shown', ['channel' => 'popup', 'status' => 'ok', 'level' => (int) $d['level'], 'users_id' => $uid, 'target_type' => 'user', 'target_id' => $uid, 'actor' => 'user',
                     'message' => 'Pop-up exibido para ' . Ui::userName($uid) . ' após ' . Ui::dur($lag) . ' na fila.', 'detail' => ['delivery' => (int) $d['id'], 'lag_s' => $lag]]);

@@ -48,18 +48,24 @@ class EventIntake
             }
             $host = trim((string) ($p['host'] ?? $p['hostname'] ?? ''));
             $message = trim((string) ($p['message'] ?? $p['description'] ?? ''));
-            $system = mb_substr(trim((string) ($p['source'] ?? 'webhook')), 0, 40);
+            $source = trim((string) ($p['source'] ?? 'webhook'));
+            $system = mb_substr($source, 0, 40);
             $severity = self::severity($p['severity'] ?? 3);
             $recovery = self::isRecovery($p);
-            $key = trim((string) ($p['dedup_key'] ?? ''));
-            if ($key === '') {
-                $key = 'evt:' . sha1($system . '|' . ($p['trigger_id'] ?? $title) . '|' . $host);
-            }
+            $key = IntegrationKey::webhook(trim((string) ($p['dedup_key'] ?? '')), $source, (string) ($p['trigger_id'] ?? $title), $host);
 
             if ($recovery) {
                 foreach (self::openByKey($key) as $e) {
+                    try {
+                        Escalation::resolve((int) $e['id'], 'evento recuperado');
+                    } catch (RuntimeException $exception) {
+                        if ($exception->getCode() === 409) {
+                            return [200, ['ok' => true, 'action' => 'ignored']];
+                        }
+                        throw $exception;
+                    }
                     Log::write($e, 'webhook', ['status' => 'ok', 'actor' => 'webhook', 'message' => 'Recuperação recebida de ' . $system . ($host ? ' (' . $host . ')' : '') . '.', 'detail' => self::safe($p)]);
-                    Escalation::resolve((int) $e['id'], 'evento recuperado');
+                    Dispatcher::flush((int) $e['id']);
                     return [200, ['ok' => true, 'action' => 'resolved', 'trace_id' => $e['trace_id']]];
                 }
                 Log::write(null, 'webhook', ['status' => 'info', 'actor' => 'webhook', 'message' => 'Recuperação sem escalonamento aberto: ' . $title, 'detail' => self::safe($p)]);
@@ -91,6 +97,7 @@ class EventIntake
             $e = Escalation::get($id);
             if ($created) {
                 Log::write($e, 'webhook', ['status' => 'ok', 'actor' => 'webhook', 'message' => 'Evento recebido de ' . $system . ' e escalonamento aberto.', 'detail' => self::safe($p)]);
+                Dispatcher::flush($id);
             }
             return [$created ? 201 : 200, ['ok' => true, 'action' => $created ? 'opened' : 'deduplicated', 'trace_id' => $e['trace_id'], 'id' => $id]];
         } catch (RuntimeException $e) {

@@ -20,6 +20,12 @@ class Channels
         return in_array($channel, Settings::channels(Settings::get('sink')), true);
     }
 
+    /** Resultado de um envio que ficou retido pela simulação: não houve chamada ao provedor. */
+    public static function simulationResult(): array
+    {
+        return ['ok' => true, 'provider_id' => 'simulado', 'error' => '', 'ms' => 0, 'detail' => ['simulado' => true]];
+    }
+
     public static function enabled(string $channel): bool
     {
         return match ($channel) {
@@ -197,6 +203,10 @@ class Channels
     /** Resposta livre ao usuário pelo WhatsApp (confirmação de ACK). */
     public static function whatsappReply(string $phone, string $text): array
     {
+        // A confirmação é automática: na simulação ela também não pode alcançar o provedor.
+        if (self::sinked('whatsapp')) {
+            return self::simulationResult();
+        }
         if (!self::waReady()) {
             return self::fail('WhatsApp não configurado.');
         }

@@ -63,7 +63,7 @@ foreach ($rows as $s) {
         . '<td>' . $pct($s['ack']['compliance']) . '<div class="small text-secondary">≤ ' . (int) $p['ack_slo_min'] . ' min · ' . $s['ack_breaches'] . ' estourado(s)' . ($s['ack_warn'] ? ' · ' . $s['ack_warn'] . ' em risco' : '') . '</div></td>'
         . '<td>' . $pct($s['res']['compliance']) . '<div class="small text-secondary">≤ ' . (int) $p['resolve_slo_min'] . ' min · ' . $s['res_breaches'] . ' estourado(s)' . ($s['res_warn'] ? ' · ' . $s['res_warn'] . ' em risco' : '') . '</div></td>'
         . '<td>' . Ui::e(Ui::dur($s['mtta'])) . '</td><td>' . Ui::e(Ui::dur($s['mttr'])) . '</td>'
-        . '<td>' . ($s['total'] ? Ui::bar(max(0, $rem), $color) . '<div class="small text-secondary">' . Ui::e(number_format($rem, 0)) . '% restante · ' . (int) $b['consumed'] . ' de ' . Ui::e(number_format($b['allowed'], 1, ',', '')) . ' permitidos</div>' : '<span class="text-secondary">sem dados</span>') . '</td>'
+        . '<td>' . ($s['total'] ? Ui::bar(max(0, $rem), $color) . '<div class="small text-secondary">' . Ui::e(Slo::remainingLabel((float) $rem)) . ' · ' . (int) $b['consumed'] . ' de ' . Ui::e(number_format($b['allowed'], 1, ',', '')) . ' permitidos</div>' : '<span class="text-secondary">sem dados</span>') . '</td>'
         . '<td>' . ($s['total24'] ? Ui::badge(number_format($burn, 1, ',', '') . '×', $burn > 1 ? '#ef4444' : ($burn > 0.5 ? '#f59e0b' : '#22c55e')) : '<span class="text-secondary">—</span>') . '</td>'
         . '<td>' . Ui::badge($label, $color) . '</td></tr>';
 }

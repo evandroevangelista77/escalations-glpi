@@ -2,7 +2,7 @@
 /**
  * Roda UM ciclo do motor de escalonamento (sobe níveis, confere SLO, reenvia falhas, observa chamados e itens com prazo).
  * Serve para quem não tem o cron do GLPI rodando a cada minuto: chama só o Escalations, sem disparar as outras ações
- * automáticas do GLPI. Evita execuções sobrepostas (trava de arquivo).
+ * automáticas do GLPI. O motor compartilha a trava com as outras entradas.
  *
  *   * * * * * www-data /usr/bin/php /var/www/glpi/plugins/escalations/tools/tick.php >/dev/null 2>&1
  *
@@ -16,10 +16,6 @@ $root = getenv('GLPI_ROOT') ?: dirname(__DIR__, 3);
 chdir($root);
 require $root . '/vendor/autoload.php';
 
-$lock = fopen(sys_get_temp_dir() . '/escalations-tick.lock', 'c');
-if (!$lock || !flock($lock, LOCK_EX | LOCK_NB)) {
-    exit(0); // o ciclo anterior ainda está rodando
-}
 $kernel = new Glpi\Kernel\Kernel('production');
 $kernel->boot();
 

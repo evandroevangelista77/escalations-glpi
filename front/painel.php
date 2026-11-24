@@ -68,7 +68,7 @@ if ($policies) {
         echo '<tr><td><a href="' . Ui::e(Menu::url('/front/hierarquia.php?id=' . (int) $p['id'])) . '">' . Ui::e($p['name']) . '</a><div class="small text-secondary">' . Ui::e($p['area']) . '</div></td>'
             . '<td>' . ($s['ack']['compliance'] === null ? '—' : Ui::e(number_format($s['ack']['compliance'], 1, ',', '')) . '%') . ' <span class="small text-secondary">meta ' . Ui::e(number_format((float) $p['slo_target'], 0)) . '%</span></td>'
             . '<td>' . ($s['res']['compliance'] === null ? '—' : Ui::e(number_format($s['res']['compliance'], 1, ',', '')) . '%') . '</td>'
-            . '<td>' . ($s['total'] ? Ui::bar(max(0, $rem), $color) . '<span class="small text-secondary">' . Ui::e(number_format($rem, 0)) . '% restante</span>' : '<span class="text-secondary">—</span>') . '</td>'
+            . '<td>' . ($s['total'] ? Ui::bar(max(0, $rem), $color) . '<span class="small text-secondary">' . Ui::e(Slo::remainingLabel((float) $rem)) . '</span>' : '<span class="text-secondary">—</span>') . '</td>'
             . '<td>' . Ui::badge($label, $color) . '</td></tr>';
     }
     echo '</tbody></table></div></div>';

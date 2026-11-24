@@ -16,7 +16,7 @@ class Message
         $policy = Policy::get((int) $e['policies_id']) ?: ['name' => '—', 'area' => '', 'ack_slo_min' => 0, 'resolve_slo_min' => 0];
         $levels = Policy::levels((int) $e['policies_id']);
         $pos = (int) ($level['position'] ?? $e['level']);
-        $next = $levels[$pos + 1] ?? null;
+        $next = $e['state'] === 'open' ? ($levels[$pos + 1] ?? null) : null;
         $t = Escalation::timing($e);
         $sev = Escalation::severity((int) $e['severity']);
         $facts = json_decode((string) $e['facts'], true) ?: [];
@@ -113,7 +113,8 @@ class Message
         $btn = fn (string $label, string $url, string $bg, string $fg = '#fff') => '<a href="' . $x($url) . '" style="display:inline-block;background:' . $bg . ';color:' . $fg
             . ';text-decoration:none;font-weight:700;padding:11px 20px;border-radius:8px;margin-right:8px;font-size:14px">' . $x($label) . '</a>';
         $notify = ($c['role'] ?? 'act') === 'notify' && $c['kind'] === 'level';
-        $intro = $x(Settings::get($notify ? 'mail_intro_notify' : 'mail_intro'));
+        $ask = self::asksForAck($c);
+        $intro = $x($notify || $ask ? Settings::get($notify ? 'mail_intro_notify' : 'mail_intro') : 'Aviso informativo sobre o escalonamento.');
         $footer = $x(Settings::get('mail_footer'));
 
         $html = '<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>' . $x($subject) . '</title></head>'
@@ -131,8 +132,8 @@ class Message
             . '<td width="50%" style="padding:0 6px 0 0"><div style="border:1px solid #e2e8f0;border-radius:8px;padding:10px 12px"><div style="font-size:11px;color:#64748b;text-transform:uppercase">Prazo de ACK (' . (int) $c['policy']['ack_slo_min'] . ' min)</div><div style="font-weight:700;color:' . (($t['ack_left'] ?? 1) < 0 && !$e['acked_at'] ? '#dc2626' : '#0f172a') . '">' . $x($ackTxt) . '</div></div></td>'
             . '<td width="50%" style="padding:0 0 0 6px"><div style="border:1px solid #e2e8f0;border-radius:8px;padding:10px 12px"><div style="font-size:11px;color:#64748b;text-transform:uppercase">Prazo de resolução (' . (int) $c['policy']['resolve_slo_min'] . ' min)</div><div style="font-weight:700;color:' . (($t['resolve_left'] ?? 1) < 0 ? '#dc2626' : '#0f172a') . '">' . $x($resTxt) . '</div></div></td></tr></table>'
             . $histBlock
-            . '<div style="margin-top:20px;background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:12px 14px;font-size:13px"><b>Próximo passo.</b> ' . $nextTxt . '</div>'
-            . '<div style="margin-top:22px">' . ($notify ? '' : $btn('Assumir (ACK)', $c['url'], $col)) . $btn('Abrir no GLPI', $c['url_plain'], $notify ? $col : '#e2e8f0', $notify ? '#fff' : '#0f172a') . '</div>'
+            . ($e['state'] === 'open' ? '<div style="margin-top:20px;background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:12px 14px;font-size:13px"><b>Próximo passo.</b> ' . $nextTxt . '</div>' : '')
+            . '<div style="margin-top:22px">' . ($ask ? $btn('Assumir (ACK)', $c['url'], $col) : '') . $btn('Abrir no GLPI', $c['url_plain'], $ask ? '#e2e8f0' : $col, $ask ? '#0f172a' : '#fff') . '</div>'
             . '</td></tr>'
             . '<tr><td style="padding:14px 24px;background:#f8fafc;border-top:1px solid #e2e8f0;font-size:11px;color:#64748b">' . $footer . ' · ' . $x($e['trace_id']) . ' · ' . $x(date('d/m/Y H:i')) . '</td></tr>'
             . '</table></td></tr></table></body></html>';
@@ -159,7 +160,7 @@ class Message
         if ($c['next']) {
             $lines[] = 'Sem ACK, sobe para ' . Ui::levelLabel((int) $c['pos'] + 1, (string) $c['next']['name']) . '.';
         }
-        $lines[] = (($c['role'] ?? 'act') === 'notify' && $c['kind'] === 'level' ? 'Detalhes (apenas informativo): ' . $c['url_plain'] : 'Assumir: ' . $c['url']);
+        $lines[] = self::asksForAck($c) ? 'Assumir: ' . $c['url'] : 'Detalhes (apenas informativo): ' . $c['url_plain'];
         return implode("\n", $lines);
     }
 
@@ -172,8 +173,13 @@ class Message
         if (!$e['acked_at'] && $c['timing']['ack_left'] !== null) {
             $body .= "\n" . ($c['timing']['ack_left'] < 0 ? 'Prazo de ACK estourado há ' . Ui::dur(-$c['timing']['ack_left']) . '.' : 'Prazo de ACK: restam ' . Ui::dur($c['timing']['ack_left']) . '.');
         }
-        $reply = ($c['role'] ?? 'act') === 'notify' && $c['kind'] === 'level' ? "\n\nApenas informativo: nenhuma ação sua é necessária." : (Settings::bool('wa_ack_reply') ? "\n\nResponda *ACK " . (int) $e['id'] . '* para assumir.' : '');
+        $reply = !self::asksForAck($c) ? "\n\nApenas informativo: nenhuma ação sua é necessária." : (Settings::bool('wa_ack_reply') ? "\n\nResponda *ACK " . (int) $e['id'] . '* para assumir.' : '');
         return $head . $body . $reply . "\nFicha: " . $c['url_plain'];
+    }
+
+    private static function asksForAck(array $c): bool
+    {
+        return $c['e']['state'] === 'open' && ($c['role'] ?? 'act') !== 'notify';
     }
 
     // ------------------------------------------------------------------ Teams (cartão adaptável)
@@ -207,10 +213,10 @@ class Message
                         ['type' => 'FactSet', 'facts' => $facts],
                         $c['next'] ? ['type' => 'TextBlock', 'wrap' => true, 'isSubtle' => true, 'text' => 'Sem ACK, sobe para ' . Ui::levelLabel((int) $c['pos'] + 1, (string) $c['next']['name']) . '.'] : null,
                     ])),
-                    'actions' => [
-                        ['type' => 'Action.OpenUrl', 'title' => 'Assumir (ACK)', 'url' => $c['url']],
+                    'actions' => array_values(array_filter([
+                        self::asksForAck($c) ? ['type' => 'Action.OpenUrl', 'title' => 'Assumir (ACK)', 'url' => $c['url']] : null,
                         ['type' => 'Action.OpenUrl', 'title' => 'Abrir no GLPI', 'url' => $c['url_plain']],
-                    ],
+                    ])),
                 ],
             ]],
         ];

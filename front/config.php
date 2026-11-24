@@ -138,7 +138,7 @@ echo "<div class='card mb-3'><div class='card-header'><h3 class='card-title'><i 
 foreach (['email', 'teams', 'whatsapp'] as $k) {
     echo Ui::check('sink[]', in_array($k, $sinkOn, true), Policy::CHANNELS[$k][0], $k);
 }
-echo "</div></div><div class='small text-secondary mt-2'>Use a simulação em ambiente de teste, ou antes de configurar o SMTP, o Teams e o WhatsApp: tudo funciona e aparece em <a href='" . Ui::e(Menu::url('/front/outbox.php')) . "'>Mensagens enviadas</a>, sem sair nada de verdade. E-mail simulado ainda exige que o usuário tenha e-mail cadastrado.</div></div></div>";
+echo "</div></div><div class='small text-secondary mt-2'>Use a simulação em ambiente de teste, ou antes de configurar o SMTP, o Teams e o WhatsApp: tudo funciona e aparece em <a href='" . Ui::e(Menu::url('/front/outbox.php')) . "'>Mensagens enviadas</a>, sem sair nada de verdade. E-mail simulado ainda exige que o usuário tenha e-mail cadastrado. Falhas de um canal simulado não acionam um canal reserva real. Os botões de teste em “Testar” são envios reais e explícitos, mesmo com a simulação ligada.</div></div></div>";
 
 // e-mail
 echo "<div class='card mb-3'><div class='card-header'><h3 class='card-title'><i class='ti ti-mail me-1'></i>E-mail</h3></div><div class='card-body'><div class='row g-3'>"
@@ -222,7 +222,7 @@ echo '</div></div>';
 
 // testes
 echo "<div class='card mb-3'><div class='card-header'><h3 class='card-title'><i class='ti ti-flask me-1'></i>Testar</h3></div><div class='card-body'>"
-    . "<div class='small text-secondary mb-2'>Salve a configuração antes de testar. Os testes ficam nos logs (evento “Teste de canal”) e não abrem escalonamento.</div>"
+    . "<div class='small text-secondary mb-2'>Salve a configuração antes de testar. Os testes ficam nos logs (evento “Teste de canal”) e não abrem escalonamento. Eles fazem um envio real e explícito ao provedor, inclusive com o modo simulação ligado: servem para confirmar a configuração. Para conferir o conteúdo sem enviar, use a Caixa de saída.</div>"
     . Ui::formOpen($self, 'd-flex flex-wrap gap-2 align-items-end')
     . Ui::submit('Enviar e-mail para mim', 'do', 'test_mail', 'ti-mail', 'btn-outline-primary')
     . Ui::submit('Testar Teams', 'do', 'test_teams', 'ti-brand-teams', 'btn-outline-primary')

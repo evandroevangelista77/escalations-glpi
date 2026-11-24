@@ -71,7 +71,7 @@ class Settings
     public static function get(string $key, ?string $default = null): string
     {
         $value = Config::getConfigurationValues(self::CONTEXT)[$key] ?? null;
-        if ($value === null || $value === '') {
+        if ($value === null || ($value === '' && !in_array($key, ['sources', 'owner_channels'], true))) {
             return (string) ($default ?? self::DEFAULTS[$key] ?? '');
         }
         if (in_array($key, self::SECRETS, true)) {

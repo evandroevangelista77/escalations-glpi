@@ -7,6 +7,7 @@
  */
 
 use GlpiPlugin\Escalations\Channels;
+use GlpiPlugin\Escalations\Dispatcher;
 use GlpiPlugin\Escalations\Escalation;
 use GlpiPlugin\Escalations\Log;
 use GlpiPlugin\Escalations\Settings;
@@ -69,7 +70,9 @@ foreach ((array) ($data['entry'] ?? []) as $entry) {
             // qual escalonamento? o número informado, ou o último que avisou este usuário e ainda aguarda ACK
             $escId = (int) ($mm[2] ?? 0);
             if (!$escId) {
-                foreach ($DB->request(['SELECT' => 'escalations_id', 'FROM' => Escalation::DELIVERIES, 'WHERE' => ['users_id' => $uid, 'channel' => 'whatsapp', 'kind' => 'level'], 'ORDER' => ['id DESC'], 'LIMIT' => 10]) as $d) {
+                foreach ($DB->request(['SELECT' => 'escalations_id', 'FROM' => Escalation::DELIVERIES, 'WHERE' => [
+                    'users_id' => $uid, 'channel' => 'whatsapp', 'kind' => 'level', 'status' => ['sent', 'sending', 'uncertain'],
+                ], 'ORDER' => ['id DESC'], 'LIMIT' => 10]) as $d) {
                     $cand = Escalation::get((int) $d['escalations_id']);
                     if ($cand && $cand['state'] === 'open') {
                         $escId = (int) $cand['id'];
@@ -82,12 +85,21 @@ foreach ((array) ($data['entry'] ?? []) as $entry) {
                 if (!$e || !\GlpiPlugin\Escalations\Perms::can('ack', $e, $uid)) {
                     throw new RuntimeException('Não encontrei um escalonamento seu aguardando ACK, ou você só é notificado e não pode assumir.');
                 }
-                Log::write($e, 'inbound', ['channel' => 'whatsapp', 'status' => 'ok', 'users_id' => $uid, 'actor' => 'whatsapp', 'message' => 'Resposta "' . trim($text) . '" recebida de ' . Ui::userName($uid) . '.']);
                 Escalation::ack($escId, $uid, 'whatsapp');
-                Channels::whatsappReply($from, '✅ ACK registrado em ' . $e['trace_id'] . '. A escalada foi interrompida.');
+                Dispatcher::flush($escId);
+                Log::write($e, 'inbound', ['channel' => 'whatsapp', 'status' => 'ok', 'users_id' => $uid, 'actor' => 'whatsapp', 'message' => 'Resposta "' . trim($text) . '" recebida de ' . Ui::userName($uid) . '.']);
+                $reply = Channels::whatsappReply($from, '✅ ACK registrado em ' . $e['trace_id'] . '. A escalada foi interrompida.');
+                if (!empty($reply['detail']['simulado'])) {
+                    Log::write($e, 'inbound', ['channel' => 'whatsapp', 'status' => 'info', 'users_id' => $uid, 'actor' => 'whatsapp',
+                        'message' => 'Confirmação do ACK simulada: nenhuma mensagem foi enviada ao provedor de WhatsApp.', 'detail' => ['simulado' => true]]);
+                }
             } catch (Throwable $x) {
                 Log::write($e, 'inbound', ['channel' => 'whatsapp', 'status' => 'fail', 'users_id' => $uid, 'actor' => 'whatsapp', 'message' => 'ACK por WhatsApp não registrado: ' . $x->getMessage()]);
-                Channels::whatsappReply($from, '⚠️ ' . $x->getMessage());
+                $reply = Channels::whatsappReply($from, '⚠️ ' . $x->getMessage());
+                if (!empty($reply['detail']['simulado'])) {
+                    Log::write($e, 'inbound', ['channel' => 'whatsapp', 'status' => 'info', 'users_id' => $uid, 'actor' => 'whatsapp',
+                        'message' => 'Resposta de erro do ACK simulada: nenhuma mensagem foi enviada ao provedor de WhatsApp.', 'detail' => ['simulado' => true]]);
+                }
             }
         }
     }

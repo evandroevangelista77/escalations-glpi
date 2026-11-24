@@ -75,6 +75,15 @@ class Slo
         ];
     }
 
+    /**
+     * Texto do orçamento para as telas. "Restante" só faz sentido enquanto há saldo;
+     * com saldo zero ou negativo o orçamento está esgotado.
+     */
+    public static function remainingLabel(float $remaining): string
+    {
+        return $remaining > 0 ? number_format($remaining, 0, ',', '') . '% restante' : 'esgotado';
+    }
+
     /** Todas as hierarquias ativas com as estatísticas, mais os totais. */
     public static function overview(): array
     {

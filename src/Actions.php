@@ -43,14 +43,7 @@ class Actions
                 Escalation::cancel($escId, trim((string) ($in['note'] ?? '')) ?: 'cancelado manualmente', $uid);
                 return 'Escalonamento cancelado.';
             case 'resend':
-                if ($e['state'] !== 'open' || !(int) $e['level']) {
-                    throw new RuntimeException('Só dá para reenviar enquanto aguarda ACK.', 409);
-                }
-                $level = Policy::level((int) $e['policies_id'], (int) $e['level']);
-                if ($level) {
-                    Log::write($e, 'repeat', ['level' => (int) $e['level'], 'status' => 'info', 'users_id' => $uid, 'message' => 'Reenvio manual dos avisos do nível N' . $e['level'] . ' por ' . Ui::userName($uid) . '.']);
-                    Engine::notify($e, $level, (int) $e['repeats'] + 100); // rodada 100+ marca o reenvio manual
-                }
+                Engine::resend($escId, $uid);
                 return 'Avisos reenviados.';
         }
         throw new RuntimeException('Ação desconhecida.', 422);

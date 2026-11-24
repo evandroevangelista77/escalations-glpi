@@ -3,6 +3,7 @@
 namespace GlpiPlugin\Escalations;
 
 use Throwable;
+use Ticket;
 
 /**
  * Fonte "chamado": observa os chamados do GLPI contra as regras das hierarquias e abre o escalonamento quando
@@ -35,18 +36,8 @@ class TicketWatcher
         global $DB;
         $n = 0;
         foreach ($DB->request(['FROM' => Escalation::TABLE, 'WHERE' => ['source' => 'ticket', 'state' => ['open', 'acked']], 'LIMIT' => 500]) as $e) {
-            $t = null;
-            foreach ($DB->request(['SELECT' => ['id', 'status', 'is_deleted'], 'FROM' => 'glpi_tickets', 'WHERE' => ['id' => (int) $e['items_id']]]) as $row) {
-                $t = $row;
-            }
             try {
-                if (!$t || (int) $t['is_deleted']) {
-                    Escalation::cancel((int) $e['id'], 'o chamado #' . (int) $e['items_id'] . ' foi excluído.');
-                    $n++;
-                } elseif ((int) $t['status'] >= 5) {
-                    Escalation::resolve((int) $e['id'], 'chamado solucionado');
-                    $n++;
-                }
+                $n += (int) Escalation::withLock((int) $e['id'], NativeItem::close(...), 0);
             } catch (Throwable $x) {
                 Log::file('autoClose ' . $e['trace_id'] . ': ' . $x->getMessage());
             }
@@ -68,7 +59,7 @@ class TicketWatcher
             if ((int) $r['sla_pct'] <= 0 && (int) $r['unassigned_min'] <= 0) {
                 continue; // regra sem gatilho de chamado (serve só para eventos)
             }
-            $where = ['status' => [1, 2, 3, 4], 'is_deleted' => 0];
+            $where = ['status' => [Ticket::INCOMING, Ticket::ASSIGNED, Ticket::PLANNED, Ticket::WAITING], 'is_deleted' => 0];
             if ((int) $r['entities_id'] >= 0) {
                 $where['entities_id'] = array_map('intval', array_values(getSonsOf('glpi_entities', (int) $r['entities_id'])));
             }
